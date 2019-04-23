@@ -214,13 +214,71 @@ W1128 16:56:55.749083 93981 negotiation.cc:318] Unauthorized connection attempt:
 
 此外，一个 tablet server 既可以成为tablets的leader，也可以成为一个别的follower
 
+![底层结构](https://kudu.apache.org/docs/images/kudu-architecture-2.png)
+
+只要有一半以上的副本可用，该tablet便可用于读写，技师在leader tablet出现故障的情况下，读取功能也可以通过read-only（只读）follower tablets来进行服务，或者是leader宕机的情况下，根据raft算法重新选举leader。
 
 
 
+开发语言：C++
+
+* 建表的时候要求所有的tserver节点都活着 
+* 根据raft机制，允许（replication的副本数-）/ 2宕掉，集群还会正常运行，否则会报错找不到ip:7050（7050是rpc的通信端口号），需要注意一个问题，第一次运行的时候要保证集群处于正常状态下，也就是所有的服务都启动，如果运行过程中，允许（replication的副本数-）/ 2宕掉 
+* 读操作，只要有一台活着的情况下，就可以运行
+* KUDU分区数必须预先预定
+* 在内存中对每个Tablet分区维护一个MemRowSet来管理最新更新的数据，当尺寸超过32M后Flush到磁盘上形成DiskRowSet，多个DiskRowSet在适当的时候进行归并处理 
+* 和HBase采用的LSM（LogStructured Merge，很难对数据进行特殊编码，所以处理效率不高）方案不同的是，Kudu对同一行的数据更新记录的合并工作，不是在查询的时候发生的（HBase会将多条更新记录先后Flush到不同的Storefile中，所以读取时需要扫描多个文件，比较rowkey，比较版本等，然后进行更新操作），而是在更新的时候进行，在Kudu中一行数据只会存在于一个DiskRowSet中，避免读操作时的比较合并工作。那Kudu是怎么做到的呢？ 对于列式存储的数据文件，要原地变更一行数据是很困难的，所以在Kudu中，对于Flush到磁盘上的DiskRowSet（DRS）数据，实际上是分两种形式存在的，一种是Base的数据，按列式存储格式存在，一旦生成，就不再修改，另一种是Delta文件，存储Base数据中有变更的数据，一个Base文件可以对应多个Delta文件，这种方式意味着，插入数据时相比HBase，需要额外走一次检索流程来判定对应主键的数据是否已经存在。因此，Kudu是牺牲了写性能来换取读取性能的提升。 
+* 更新、删除操作需要记录到特殊的数据结构里，保存在内存中的DeltaMemStore或磁盘上的DeltaFIle里面。DeltaMemStore是B-Tree实现的，因此速度快，而且可修改。磁盘上的DeltaFIle是二进制的列式的块，和base数据一样都是不可修改的。因此当数据频繁删改的时候，磁盘上会有大量的DeltaFiles文件，Kudu借鉴了Hbase的方式，会定期对这些文件进行合并。 
+* 既然存在Delta数据，也就意味着数据查询时需要同时检索Base文件和Delta文件，这看起来和HBase的方案似乎又走到一起去了，不同的地方在于，Kudu的Delta文件与Base文件不同，不是按Key排序的，而是按被更新的行在Base文件中的位移来检索的，号称这样做，在定位Delta内容的时候，不需要进行字符串比较工作，因此能大大加快定位速度，但是无论如何，Delta文件的存在对检索速度的影响巨大。因此Delta文件的数量会需要控制，需要及时的和Base数据进行合并。由于Base文件是列式存储的，所以Delta文件合并时，可以有选择性的进行，比如只把变化频繁的列进行合并，变化很少的列保留在Delta文件中暂不合并，这样做也能减少不必要的IO开销。 
+* 除了Delta文件合并，DRS自身也会需要合并，为了保障检索延迟的可预测性（这一点是HBase的痛点之一，比如分区发生Major Compaction时，读写性能会受到很大影响），Kudu的compaction策略和HBase相比，有很大不同，kudu的DRS数据文件的compaction，本质上不是为了减少文件数量，实际上Kudu DRS默认是以32MB为单位进行拆分的，DRS的compaction并不减少文件数量，而是对内容进行排序重组，减少不同DRS之间key的overlap（重复），进而在检索的时候减少需要参与检索的DRS的数量。 
 
 
 
+### 6.设计原理
 
+#### 设计初衷
+
+---
+
+有一个问题我一直在考虑就是Kudu出现的意义，官方文档中强调的优点很多都是列存储的优点。
+
+那和Parquet相比，又有什么优点呢，和同事讨论，也只得到了细颗粒修改删除的区别。
+
+看到设计初衷之后明白了
+
+* 静态数据通常以Parquet/Carbon/Avro形式直接存放在HDFS中，对于分析场景，这种存储通常是更加适合的。但无论以哪种方式存在于HDFS中，都难以支持单条记录级别的更新，随机读取也并不高效。
+* 可变数据的存储通常选择HBase或者Cassandra，因为它们能够支持记录级别的高效随机读写。但这种存储却并不适合离线分析场景，因为它们在大批量数据获取时的性能较差（针对HBase而言，有两方面的主要原因：一是HFile本身的结构定义，它是按行组织数据的，这种格式针对大多数的分析场景，都会带来较大的IO消耗，因为可能会读取很多不必要的数据，相对而言Parquet格式针对分析场景就做了很多优化。 二是由于HBase本身的LSM-Tree架构决定的，HBase的读取路径中，不仅要考虑内存中的数据，同时要考虑HDFS中的一个或多个HFile，较之于直接从HDFS中读取文件而言，这种读取路径是过长的）。
+
+于是乎，上面的两种存储，都存在明显的优缺点：
+
+* 直接存放于HDFS中，适合离线分析，缺不利于记录级别的随机读写。
+* 直接将数据放于HBase/Cassandra中，适合记录级别的随机读写，对离线分析却不友好。
+
+但在很多实际业务场景中，两种场景时常是并存的，基于Spark/Hive On HBase进行，性能较差
+
+* 数据存放于HBase中，对于分析任务，基于Spark/Hive On HBase进行，性能较差。
+* 对于分析性能要求较高的，可以将数据在HDFS/Hive中多冗余存放一份，或者，将HBase中的数据定期的导出成Parquet/Carbon格式的数据。 明显这种方案对业务应用提出了较高的要求，而且容易导致在线数据与离线数据之间的一致性问题。
+
+Kudu的设计，就是试图在OLAP和OLTP之间，寻求一个最佳的结合点，从而在一个系统的一份数据中，技能支持OLAP，又能支持OLTP，另外一个初衷是，在Cloudera发布的《Kudu: New Apache Hadoop Storage for Fast Analytics on Fast Data》一文中有提及，Kudu作为一个新的分布式存储系统期望有效提升CPU的使用率，而低CPU使用率恰是HBase/Cassandra等系统的最大问题。
+
+*OLTP系统强调数据库内存效率，强调内存各种指标的命令率，强调绑定变量，强调并发操作*
+
+*OLAP系统则强调数据分析，强调SQL执行市场，强调磁盘I/O，强调分区等*
+
+*从功能角度来看，OLTP负责基本业务的正常运转，而业务数据积累时所产生的价值信息则被OLAP不断呈现，企业高层通过参考这些信息会不断调整经营方针，也会促进基础业务的不断优化，这是OLTP与OLAP最根本的区别*
+
+#### 事务与一致性
+
+Kudu仅仅提供单行事务，也不支持多行事务。这一点与HBase是相似的。但在数据一致性模型上，与HBase有较大的区别。 Kudu提供了如下两种一致性模型：
+
+- Snapshot Consistency
+
+这是Kudu中的默认一致性模型。在这种模型中，只保证一个客户端能够看到自己所提交的写操作，而并不保障全局的（跨多个客户端的）事务可见性。
+
+* External Consistency
+
+最早提出External Consistency机制的，应该是在Google的Spanner论文中。传统关系型数据库中的两阶段提交机制，需要两回合通信，这过程中带来的代价是较高的，但同时这过程中的复杂的锁机制也可能会带来一些可用性问题。一个更好的实现分布式事务/一致性的思路，是基于一个全局发布的Timestamp机制。Spanner提出了Commit-wait的机制，来保障全局事务的有序性：如果一个事务T1的提交先于另外一个事务T2的开始，则T1的Timestamp要小于T2的TimeStamp。我们知道，在分布式系统中，是很难于做这样的承诺的。在HBase中，我们可以想象，如果所有RegionServer中的SequenceID发布自同一个数据源，那么，HBase的很多事务性问题就迎刃而解了，然后最大的问题在于这个全局的SequenceID数据源将会是整个系统的性能瓶颈点。回到External Consistency机制，Spanner是依赖于高精度与可预见误差的本地时钟(TrueTime API)实现的(即需要一个高可靠和高精度的时钟源，同时，这个时钟的误差是可预见的。感兴趣的同学可以阅读Spanner论文，这里不赘述)。Kudu中提供了另外一种思路来实现External Consistency,基于Timestamp扩散机制，即，多个客户端可相互通信来告知彼此所提交的Timestamp值，从而保障一个全局的顺序。这种机制也是相对较为复杂的。
+与Spanner类似，Kudu不允许用户自定义用户数据的Timestamp，但在HBase中却是不同，用户可以发起一次基于某特定Timestamp的查询。
 
 
 
