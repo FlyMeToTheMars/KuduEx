@@ -4,15 +4,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
 import java.util.Properties;
 
-/**
- * package: com.cloudera.utils
- * describe: 客户端工具类
- * creat_user: Fayson
- * email: htechinfo@163.com
- * creat_date: 2018/11/14
- * creat_time: 下午10:17
- * 公众号：Hadoop实操
- */
+
 public class ClientUtils {
 
     /**
