@@ -40,6 +40,8 @@ public class KuduCDHExample {
         columns.add(new ColumnSchema.ColumnSchemaBuilder("childNum", Type.STRING).
                 compressionAlgorithm(ColumnSchema.CompressionAlgorithm.SNAPPY).build());
         Schema schema = new Schema(columns);
+
+
         CreateTableOptions createTableOptions = new CreateTableOptions();
         List<String> hashKeys = new ArrayList();
         hashKeys.add("id");

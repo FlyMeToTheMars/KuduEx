@@ -8,7 +8,6 @@
     <artifactId>KuduEx</artifactId>
     <version>1.0-SNAPSHOT</version>
 
-
     <dependencies>
         <dependency>
             <groupId>org.apache.kudu</groupId>
